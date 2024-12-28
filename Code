@@ -1,0 +1,199 @@
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, DepthwiseConv2D, GlobalAveragePooling2D, Dense, Dropout, MaxPooling2D, Input, Reshape, Multiply, BatchNormalization, Activation
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+# SE Block
+def se_block(input_tensor, reduction_ratio=16):
+    channel_axis = -1
+    filters = input_tensor.shape[channel_axis]
+
+    se_shape = (1, 1, filters)
+
+    se = GlobalAveragePooling2D()(input_tensor)
+    se = Reshape(se_shape)(se)
+    se = Dense(filters // reduction_ratio, activation='relu', kernel_initializer='he_normal', use_bias=False)(se)
+    se = Dense(filters, activation='sigmoid', kernel_initializer='he_normal', use_bias=False)(se)
+
+    x = Multiply()([input_tensor, se])
+    return x
+
+# Define the teacher model (EfficientNetB0)
+def efficientnet_teacher(input_shape=(224, 224, 3), num_classes=2):
+    base_model = tf.keras.applications.EfficientNetB0(input_shape=input_shape, include_top=False, weights='imagenet')
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(128, activation='relu')(x)
+    output_tensor = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs=base_model.input, outputs=output_tensor)
+    return model
+
+# Define the student model
+def student_model_with_se_bn(input_shape=(224, 224, 3), num_classes=2):
+    input_tensor = Input(shape=input_shape)
+    # First block
+    x = DepthwiseConv2D((3, 3), padding='same')(input_tensor)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(32, (1, 1), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Second block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(64, (1, 1), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Third block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(128, (1, 1), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Fourth block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(256, (1, 1), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Fifth block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(512, (1, 1), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(512, activation='relu')(x)
+    x = Dropout(0.35)(x)
+    output_tensor = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs=input_tensor, outputs=output_tensor)
+    return model
+
+# Main script to train the models
+def main():
+    # Define directories for training and validation data
+    base_dir = "/content/unzipped_dataset/Emotions-dataset-2"
+    train_dir = os.path.join(base_dir, "train")
+    validation_dir = os.path.join(base_dir, "val")
+
+    # Define paths for saving models
+    teacher_model_path = "/content/model/teacher_model_Emotions-dataset-2.keras"
+    student_model_path = "/content/model/student_model_Emotions-dataset-2.keras"
+
+    # Data Augmentation
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=40,
+        width_shift_range=0.3,
+        height_shift_range=0.3,
+        shear_range=0.3,
+        zoom_range=0.3,
+        horizontal_flip=True
+    )
+
+    validation_datagen = ImageDataGenerator(rescale=1./255)
+
+    train_generator = train_datagen.flow_from_directory(
+        train_dir,
+        target_size=(224, 224),
+        batch_size=32,
+        class_mode='categorical'
+    )
+
+    validation_generator = validation_datagen.flow_from_directory(
+        validation_dir,
+        target_size=(224, 224),
+        batch_size=32,
+        class_mode='categorical'
+    )
+
+    # Create and train teacher model
+    teacher_model = efficientnet_teacher()
+    teacher_model.compile(optimizer=Adam(learning_rate=1e-4),
+                          loss='categorical_crossentropy',
+                          metrics=['accuracy'])
+    teacher_history = teacher_model.fit(train_generator,
+                                        steps_per_epoch=train_generator.samples // train_generator.batch_size,
+                                        epochs=200,
+                                        validation_data=validation_generator,
+                                        validation_steps=validation_generator.samples // validation_generator.batch_size)
+    teacher_model.save(teacher_model_path)
+
+    # Create and train student model
+    student = student_model_with_se_bn()
+    student.compile(optimizer=Adam(learning_rate=1e-4),
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy'])
+    student_history = student.fit(train_generator,
+                                   steps_per_epoch=train_generator.samples // train_generator.batch_size,
+                                   epochs=500,
+                                   validation_data=validation_generator,
+                                   validation_steps=validation_generator.samples // validation_generator.batch_size)
+    student.save(student_model_path)
+
+    # Load and evaluate student model
+    loaded_student = tf.keras.models.load_model(student_model_path)
+    loaded_student.compile(optimizer=Adam(learning_rate=1e-4),
+                           loss='categorical_crossentropy',
+                           metrics=['accuracy'])
+    loss, accuracy = loaded_student.evaluate(validation_generator, steps=validation_generator.samples // validation_generator.batch_size)
+    print(f"Student Model Accuracy: {accuracy:.2f}")
+
+        # Calculate model size and parameters
+    model_size = sum(tf.size(p).numpy() for p in student.trainable_weights)
+    total_params = student.count_params()
+
+    print(f"Model Size: {model_size / 1e6:.2f} MB")
+    print(f"Total Params: {total_params}")
+
+
+    # Plot Student Metrics
+    plt.figure(figsize=(12, 6))
+    plt.plot(student_history.history['accuracy'], label='Training Accuracy', linewidth=2)
+    plt.plot(student_history.history['val_accuracy'], label='Validation Accuracy', linewidth=2)
+    plt.plot(student_history.history['loss'], label='Training Loss', linewidth=2)
+    plt.plot(student_history.history['val_loss'], label='Validation Loss', linewidth=2)
+    plt.title('Student Model Metrics', fontsize=18)
+    plt.xlabel('Epochs', fontsize=16)
+    plt.ylabel('Metrics', fontsize=16)
+    plt.legend(fontsize=16)
+    #plt.grid(True)
+    plt.show()
+
+    # Plot Teacher Metrics
+    plt.figure(figsize=(12, 6))
+    plt.plot(teacher_history.history['accuracy'], label='Training Accuracy', linewidth=2)
+    plt.plot(teacher_history.history['val_accuracy'], label='Validation Accuracy', linewidth=2)
+    plt.plot(teacher_history.history['loss'], label='Training Loss', linewidth=2)
+    plt.plot(teacher_history.history['val_loss'], label='Validation Loss', linewidth=2)
+    plt.title('Teacher Model Metrics', fontsize=18)
+    plt.xlabel('Epochs', fontsize=16)
+    plt.ylabel('Metrics', fontsize=16)
+    plt.legend(fontsize=16)
+    #plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
